@@ -1,0 +1,15 @@
+# Local grouped-daily cache (rebuilt from API; persisted in CI via actions/cache)
+cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Never commit secrets
+.env
+
+# Local dev helpers / logs (not part of the production pipeline)
+_loadkey.py
+backfill.log

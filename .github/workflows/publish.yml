@@ -1,0 +1,63 @@
+name: Publish breadth series
+
+on:
+  schedule:
+    # 21:15 UTC = 17:15 ET (EDT) / 16:15 ET (EST) — shortly after the US close.
+    # Cron runs in UTC and does not shift with DST; this fires after the close
+    # year-round. The script only emits sessions it considers final.
+    - cron: "15 21 * * 1-5"
+  workflow_dispatch: {}
+
+# Allow the job to push the updated JSON back to the repo.
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-breadth
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Persist the grouped-daily cache between runs so each historical day is
+      # fetched from the API at most once. The key rotates daily so the newest
+      # cache is always saved; restore-keys fall back to the latest prior cache.
+      - name: Restore grouped-daily cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: grouped-cache-${{ github.run_id }}
+          restore-keys: |
+            grouped-cache-
+
+      - name: Generate breadth series
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          # "US Comm Stks" = common stocks. Set to "false" to include every
+          # stock-market security (ETFs, ADRs, preferreds, warrants, units...).
+          COMMON_STOCK_ONLY: "true"
+        run: python breadth.py --out breadth_5d_up20.json
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- breadth_5d_up20.json; then
+            echo "No change in breadth_5d_up20.json; nothing to commit."
+          else
+            git add breadth_5d_up20.json
+            git commit -m "Update breadth_5d_up20.json [skip ci]"
+            git push
+          fi
