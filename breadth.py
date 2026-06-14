@@ -27,6 +27,7 @@ import os
 import sys
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -35,12 +36,29 @@ import requests
 API_BASE = "https://api.massive.com"
 ET = ZoneInfo("America/New_York")
 
-# Primary-exchange MIC codes that count as our two venues.
-NYSE_MICS = {"XNYS"}
-# Massive returns a single "XNAS" for all NASDAQ tiers today; the others are
-# accepted defensively in case tiered codes ever appear.
-NASDAQ_MICS = {"XNAS", "XNGS", "XNMS", "XNCM"}
-ALLOWED_MICS = NYSE_MICS | NASDAQ_MICS
+# ============================ UNIVERSE CONFIG ============================== #
+# Tweak the two settings below to change which symbols are counted. Nothing
+# else in the pipeline (metric, output schema, publisher) depends on these.
+#
+# Listing-venue whitelist: venue label -> set of `primary_exchange` MIC codes
+# that Massive uses for that venue. Confirmed empirically by the diagnostics
+# build_universe() prints each run (do not assume the codes).
+EXCHANGE_MICS = {
+    "NYSE":          {"XNYS"},
+    "NASDAQ":        {"XNAS", "XNGS", "XNMS", "XNCM"},  # all NASDAQ tiers
+    "NYSE American": {"XASE"},   # AMEX
+    "NYSE Arca":     {"ARCX"},   # predominantly ETFs -> few/zero CS (expected)
+    "Cboe BZX":      {"BATS"},   # predominantly ETFs -> few/zero CS (expected)
+}
+
+# Security-type whitelist: keep ONLY these Massive `type` codes. "CS" == common
+# stock. Everything else is dropped (ETF/ETP, ETN, FUND/closed-end, ADRC,
+# PFD, WARRANT, RIGHT, UNIT, SP/structured, ...).
+TYPE_WHITELIST = {"CS"}
+# ========================================================================== #
+
+# Flattened set of every accepted MIC, derived from EXCHANGE_MICS.
+ALLOWED_MICS = {mic for mics in EXCHANGE_MICS.values() for mic in mics}
 
 # Session is considered final after this ET hour (lets EOD consolidation settle).
 SESSION_FINAL_HOUR_ET = 20
@@ -98,9 +116,11 @@ class MassiveClient:
 # --------------------------------------------------------------------------- #
 # Universe
 # --------------------------------------------------------------------------- #
-def build_universe(client: MassiveClient, common_stock_only: bool) -> set[str]:
-    """Current active NYSE/NASDAQ stock-market symbols."""
-    tickers: set[str] = set()
+def build_universe(client: MassiveClient) -> set[str]:
+    """Current active common stocks (TYPE_WHITELIST) on the venues in
+    EXCHANGE_MICS. Pulls the full active equity list once, prints diagnostics,
+    then applies the venue + type filters."""
+    rows: list[tuple[str | None, str | None, str | None]] = []  # (ticker, type, mic)
     params = {
         "market": "stocks",
         "active": "true",
@@ -117,17 +137,61 @@ def build_universe(client: MassiveClient, common_stock_only: bool) -> set[str]:
         for r in data.get("results", []):
             if r.get("market") != "stocks" or not r.get("active"):
                 continue
-            if r.get("primary_exchange") not in ALLOWED_MICS:
-                continue
-            if common_stock_only and r.get("type") != "CS":
-                continue
-            tickers.add(r["ticker"])
+            rows.append((r.get("ticker"), r.get("type"), r.get("primary_exchange")))
         next_url = data.get("next_url")
         if not next_url:
             break
-    print(f"Universe: {len(tickers)} symbols "
-          f"({'CS only' if common_stock_only else 'all stock types'}, "
-          f"NYSE+NASDAQ, {pages} pages).")
+
+    type_counts = Counter(t for _, t, _ in rows)
+    exch_counts = Counter(e for _, _, e in rows)
+
+    print(f"\n=== Active equity universe (market=stocks, active=true): "
+          f"{len(rows)} symbols, {pages} pages ===")
+
+    # (b) security-type breakdown of the pre-filter equity universe.
+    print("Pre-filter security-type breakdown:")
+    for t, c in type_counts.most_common():
+        print(f"  {str(t):<8} {c}")
+    if "CS" not in type_counts:
+        print("  WARNING: Massive returned no 'CS' type; adjust TYPE_WHITELIST.")
+
+    # distinct primary_exchange values actually returned (do not assume MICs).
+    print("Pre-filter primary_exchange values:")
+    for e, c in exch_counts.most_common():
+        tag = "  <- target venue" if e in ALLOWED_MICS else ""
+        print(f"  {str(e):<8} {c}{tag}")
+
+    # confirm the mapping for all five target venues.
+    print("Target-venue mapping confirmation:")
+    for venue, mics in EXCHANGE_MICS.items():
+        present = sorted(m for m in mics if exch_counts.get(m))
+        total = sum(exch_counts.get(m, 0) for m in mics)
+        status = f"present={present}" if present else "present=NONE"
+        print(f"  {venue:<14} {sorted(mics)}  {status}  all-types={total}")
+
+    # type breakdown restricted to the target venues -> shows what is dropped.
+    in_target = [(tk, t, e) for tk, t, e in rows if e in ALLOWED_MICS]
+    tgt_types = Counter(t for _, t, _ in in_target)
+    print(f"\nType breakdown WITHIN target venues ({len(in_target)} symbols):")
+    for t, c in tgt_types.most_common():
+        print(f"  {str(t):<8} {c:<6} {'KEEP' if t in TYPE_WHITELIST else 'drop'}")
+
+    # final filter: venue AND type.
+    kept = [(tk, e) for tk, t, e in in_target if t in TYPE_WHITELIST]
+    tickers = {tk for tk, _ in kept if tk}
+
+    # (a) count of kept symbols per primary_exchange + grand total.
+    per_mic = Counter(e for _, e in kept)
+    print(f"\n=== Final universe: types {sorted(TYPE_WHITELIST)} on target venues ===")
+    for venue, mics in EXCHANGE_MICS.items():
+        venue_total = 0
+        for m in sorted(mics):
+            if per_mic.get(m):
+                print(f"  {venue:<14} {m:<6} {per_mic[m]}")
+                venue_total += per_mic[m]
+        if venue_total == 0:
+            print(f"  {venue:<14} {'-':<6} 0")
+    print(f"  {'GRAND TOTAL':<21} {len(tickers)}")
     return tickers
 
 
@@ -264,12 +328,6 @@ def main() -> int:
     ap.add_argument("--lookback", type=int, default=5, help="trading-session offset")
     ap.add_argument("--threshold", type=float, default=0.20, help="min fractional gain")
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument(
-        "--common-stock-only",
-        action="store_true",
-        default=os.environ.get("COMMON_STOCK_ONLY", "").lower() in ("1", "true", "yes"),
-        help="restrict universe to type==CS (default False)",
-    )
     ap.add_argument("--tc2000", metavar="YYYY-MM-DD=VALUE",
                     help="known TC2000 value to compare against for tuning")
     args = ap.parse_args()
@@ -291,7 +349,7 @@ def main() -> int:
     series_start = today_et - dt.timedelta(days=span_days)
     fetch_start = series_start - dt.timedelta(days=20)  # buffer for the offset
 
-    universe = build_universe(client, args.common_stock_only)
+    universe = build_universe(client)
     sessions = gather_sessions(client, Path(args.cache_dir), fetch_start, end, args.workers)
     series = compute_series(sessions, universe, args.lookback, args.threshold)
 
