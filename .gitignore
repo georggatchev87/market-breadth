@@ -12,4 +12,6 @@ venv/
 
 # Local dev helpers / logs (not part of the production pipeline)
 _loadkey.py
-backfill.log
+_probe*.py
+_test*.json
+*.log
