@@ -20,7 +20,12 @@ Data source: Massive.com REST API (Polygon-compatible).
     returns rows). Point-in-time candidate set per day = symbols present in that
     day's bars (so delisted names are counted on the days they traded).
 
-Output: breadth_5d_up20.json -> [{"date":"YYYY-MM-DD","value":<int>}, ...] asc.
+Also produces the bearish mirror "US Comm Stks 5 Day Down 20%" in the same pass
+(same universe/bars/calendar), using close(D)/close(D-5) < 0.80.
+
+Output (both sorted ascending, schema [{"date":"YYYY-MM-DD","value":<int>}]):
+  - breadth_5d_up20.json     (close(D)/close(D-5) >= 1.20)
+  - breadth_5d_down20.json   (close(D)/close(D-5) <  0.80)
 
 The API key is read from MASSIVE_API_KEY. It is never printed or persisted.
 """
@@ -61,9 +66,10 @@ TYPE_WHITELIST = {"CS"}
 ALLOWED_MICS = {mic for mics in EXCHANGE_MICS.values() for mic in mics}
 
 # ========================== QUALIFIER THRESHOLDS =========================== #
-# Stockbee "US Comm Stks 5 Day up 20%". Tune here.
+# Stockbee "US Comm Stks 5 Day up 20%" (and the bearish mirror). Tune here.
 MOVE_LOOKBACK = 5         # trading sessions for the % move (D vs D-5)
-MOVE_THRESHOLD = 0.20     # close(D)/close(D-5) - 1 >= this
+MOVE_THRESHOLD = 0.20     # UP series:   close(D)/close(D-5) - 1 >= this  (>= 1.20x)
+DOWN_THRESHOLD = 0.20     # DOWN series: close(D)/close(D-5) - 1 <  -this (<  0.80x)
 PRICE_FLOOR = 5.0         # close(D) >= this ($)
 VOL_LOOKBACK = 3          # use volumes of D-1 .. D-VOL_LOOKBACK
 MIN_VOLUME = 100_000      # min(volume over that window) must be STRICTLY > this
@@ -334,22 +340,27 @@ def write_checkpoint(cache_dir: Path, target: int, completed: int,
 # Metric
 # --------------------------------------------------------------------------- #
 class Cfg:
-    def __init__(self, move_lookback, move_threshold, price_floor,
-                 vol_lookback, min_volume):
+    def __init__(self, move_lookback, move_threshold, down_threshold,
+                 price_floor, vol_lookback, min_volume):
         self.move_lookback = move_lookback
-        self.move_factor = 1.0 + move_threshold
+        self.move_factor = 1.0 + move_threshold   # UP:   ratio >= this
+        self.down_factor = 1.0 - down_threshold   # DOWN: ratio <  this
         self.price_floor = price_floor
         self.vol_lookback = vol_lookback
         self.min_volume = min_volume
 
 
-def count_day(i, days, sessions, universe, cfg) -> tuple[int, int, int]:
-    """Return (pre, after_price, after_volume) counts for trading_days[i].
-    pre = +20% move only (old qualifier); after_volume = full Stockbee count."""
+def count_day(i, days, sessions, universe, cfg) -> dict:
+    """Count up- and down-qualifiers for trading_days[i] in a single pass over
+    the day's bars. The $5 price floor and the min-volume floor are shared; only
+    the 5-session move condition differs (>= 1.20x up vs < 0.80x down).
+
+    Returns {"up", "down", "up_pre", "up_price"} where up_pre/up_price are the
+    move-only and move+price intermediate counts (for the up breakdown report)."""
     now = sessions[days[i]]
     past = sessions[days[i - cfg.move_lookback]]
     vol_days = [sessions[days[i - k]] for k in range(1, cfg.vol_lookback + 1)]
-    pre = after_price = after_vol = 0
+    up = down = up_pre = up_price = 0
     for sym, rec in now.items():
         if sym not in universe:
             continue
@@ -357,13 +368,19 @@ def count_day(i, days, sessions, universe, cfg) -> tuple[int, int, int]:
         p = past.get(sym)
         if p is None or p[0] <= 0:
             continue
-        if c_now < p[0] * cfg.move_factor:        # condition 1: +20% over 5 sessions
+        c_past = p[0]                                 # condition 1: the 5-session move.
+        is_up = c_now >= c_past * cfg.move_factor     #   up:   >= 1.20x (multiplication
+        is_down = c_now < c_past * cfg.down_factor    #   down: <  0.80x  form, matches the
+        #                                               original up series exactly)
+        if is_up:
+            up_pre += 1
+        if not (is_up or is_down):
             continue
-        pre += 1
-        if c_now < cfg.price_floor:               # condition 2: >= $5
+        if c_now < cfg.price_floor:                   # condition 2: close >= $5
             continue
-        after_price += 1
-        vmin = None                               # condition 3: min vol(D-1..D-3) > 100k
+        if is_up:
+            up_price += 1
+        vmin = None                                   # condition 3: min vol(D-1..D-3) > 100k
         ok = True
         for vd in vol_days:
             r = vd.get(sym)
@@ -373,18 +390,24 @@ def count_day(i, days, sessions, universe, cfg) -> tuple[int, int, int]:
             vmin = r[1] if vmin is None else min(vmin, r[1])
         if not ok or vmin is None or vmin <= cfg.min_volume:
             continue
-        after_vol += 1
-    return pre, after_price, after_vol
+        if is_up:
+            up += 1
+        else:
+            down += 1
+    return {"up": up, "down": down, "up_pre": up_pre, "up_price": up_price}
 
 
 def compute_series(sessions, universe, cfg):
+    """Compute both the up and down series in one pass over the cached bars.
+    Returns (up_series, down_series, days)."""
     days = sorted(d for d, bars in sessions.items() if bars)
     start_i = max(cfg.move_lookback, cfg.vol_lookback)
-    out = []
+    up_out, down_out = [], []
     for i in range(start_i, len(days)):
-        _, _, post = count_day(i, days, sessions, universe, cfg)
-        out.append({"date": days[i], "value": post})
-    return out, days
+        c = count_day(i, days, sessions, universe, cfg)
+        up_out.append({"date": days[i], "value": c["up"]})
+        down_out.append({"date": days[i], "value": c["down"]})
+    return up_out, down_out, days
 
 
 # --------------------------------------------------------------------------- #
@@ -392,11 +415,14 @@ def compute_series(sessions, universe, cfg):
 # --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description="Stockbee US 5-day up-20% breadth series.")
-    ap.add_argument("--out", default="breadth_5d_up20.json")
+    ap.add_argument("--out", default="breadth_5d_up20.json", help="up-series output")
+    ap.add_argument("--down-out", default="breadth_5d_down20.json",
+                    help="down-series output")
     ap.add_argument("--cache-dir", default="cache")
     ap.add_argument("--start-date", default=START_DATE)
     ap.add_argument("--lookback", type=int, default=MOVE_LOOKBACK)
     ap.add_argument("--threshold", type=float, default=MOVE_THRESHOLD)
+    ap.add_argument("--down-threshold", type=float, default=DOWN_THRESHOLD)
     ap.add_argument("--price-floor", type=float, default=PRICE_FLOOR)
     ap.add_argument("--vol-lookback", type=int, default=VOL_LOOKBACK)
     ap.add_argument("--min-volume", type=float, default=MIN_VOLUME)
@@ -405,8 +431,8 @@ def main() -> int:
                     help="known TC2000/Stockbee value to compare for tuning")
     args = ap.parse_args()
 
-    cfg = Cfg(args.lookback, args.threshold, args.price_floor,
-              args.vol_lookback, args.min_volume)
+    cfg = Cfg(args.lookback, args.threshold, args.down_threshold,
+              args.price_floor, args.vol_lookback, args.min_volume)
     client = MassiveClient(os.environ.get("MASSIVE_API_KEY", ""))
 
     now_et = dt.datetime.now(ET)
@@ -419,53 +445,69 @@ def main() -> int:
 
     universe = build_universe(client)
     sessions = gather_sessions(client, Path(args.cache_dir), fetch_start, end, args.workers)
-    series, days = compute_series(sessions, universe, cfg)
-    series = [pt for pt in series if pt["date"] >= series_start.isoformat()]
-    series.sort(key=lambda p: p["date"])
+    up_series, down_series, days = compute_series(sessions, universe, cfg)
 
-    Path(args.out).write_text(json.dumps(series, indent=2) + "\n", encoding="utf-8")
+    def trim(s):
+        s = [pt for pt in s if pt["date"] >= series_start.isoformat()]
+        s.sort(key=lambda p: p["date"])
+        return s
 
-    # ---------------- validation report ----------------
-    print(f"\nWrote {len(series)} points to {args.out}")
-    if not series:
+    up_series = trim(up_series)
+    down_series = trim(down_series)
+
+    Path(args.out).write_text(json.dumps(up_series, indent=2) + "\n", encoding="utf-8")
+    Path(args.down_out).write_text(json.dumps(down_series, indent=2) + "\n", encoding="utf-8")
+
+    if not up_series:
         print("No points produced."); return 1
-    vals = [p["value"] for p in series]
-    print(f"Range: {series[0]['date']} .. {series[-1]['date']}")
-    print(f"Stats: count={len(vals)} min={min(vals)} mean={sum(vals)/len(vals):.1f} "
-          f"median={statistics.median(vals):.1f} max={max(vals)}")
-    print("\nLast 10 values:")
-    for pt in series[-10:]:
-        print(f"  {pt['date']}  {pt['value']}")
 
-    # pre vs post filter on sample dates (how many $5 + volume floors remove)
+    def stats(series, name):
+        vals = [p["value"] for p in series]
+        srt = sorted(vals)
+        med = statistics.median(vals)
+        p95 = srt[min(len(srt) - 1, int(len(srt) * 0.95))]
+        print(f"\n=== {name} ({len(series)} pts, "
+              f"{series[0]['date']} .. {series[-1]['date']}) ===")
+        print(f"Stats: count={len(vals)} min={min(vals)} mean={sum(vals)/len(vals):.1f} "
+              f"median={med:.1f} p95={p95} max={max(vals)}")
+        print("Last 10:")
+        for pt in series[-10:]:
+            print(f"  {pt['date']}  {pt['value']}")
+        return vals
+
+    print(f"\nWrote {len(up_series)} pts -> {args.out}")
+    print(f"Wrote {len(down_series)} pts -> {args.down_out}")
+    assert len(up_series) == len(down_series), "up/down length mismatch"
+    assert [p["date"] for p in up_series] == [p["date"] for p in down_series], \
+        "up/down date mismatch"
+
+    up_vals = stats(up_series, "UP   (5 Day up 20%)")
+
+    # up pre/post-filter breakdown on sample dates (kept from before)
     date_to_i = {d: i for i, d in enumerate(days)}
-    n = len(series)
-    sample = [series[-1]["date"], series[-2]["date"],
-              series[n // 2]["date"], series[n // 4]["date"]]
-    print("\nPre/post-filter breakdown (move-only -> +$5 floor -> +vol floor = value):")
+    n = len(up_series)
+    sample = [up_series[-1]["date"], up_series[n // 2]["date"], up_series[n // 4]["date"]]
+    print("\nUP pre/post-filter (move-only -> +$5 -> +vol = value):")
     for ds in sample:
-        i = date_to_i[ds]
-        pre, ap_, post = count_day(i, days, sessions, universe, cfg)
-        print(f"  {ds}: move>=20%={pre:<5} after $>={int(cfg.price_floor)}={ap_:<5} "
-              f"after minVol>{int(cfg.min_volume)}={post}")
+        c = count_day(date_to_i[ds], days, sessions, universe, cfg)
+        print(f"  {ds}: move>=20%={c['up_pre']:<5} after $>={int(cfg.price_floor)}="
+              f"{c['up_price']:<5} after minVol>{int(cfg.min_volume)}={c['up']}")
 
-    # Judge by the typical level, not the single extreme: a 10-year window
-    # includes the 2020 COVID rebound, a real breadth thrust that legitimately
-    # spikes into the hundreds. The filters are wrong only if the TYPICAL
-    # reading is high.
-    srt = sorted(vals)
-    med = statistics.median(vals)
-    p95 = srt[min(len(srt) - 1, int(len(srt) * 0.95))]
-    print(f"\nMagnitude check: median={med:.0f} p95={p95} max={max(vals)} "
-          f"(share<=60: {100*sum(v<=60 for v in vals)/len(vals):.0f}%)")
-    print("  " + ("OK: typical readings are tens (Stockbee range); extremes are "
-                  "real thrusts (e.g. the 2020 COVID rebound)."
-                  if med <= 80 else
-                  "WARNING: typical readings too high; check the $5/volume filters."))
+    down_vals = stats(down_series, "DOWN (5 Day down 20%)")
+
+    # down-series sanity: largest readings should land on known sell-offs.
+    top = sorted(down_series, key=lambda p: -p["value"])[:5]
+    print("\nDOWN top-5 readings (should cluster on real sell-offs):")
+    for pt in top:
+        print(f"  {pt['date']}  {pt['value']}")
+    med_d = statistics.median(down_vals)
+    print(f"\nDown magnitude: median={med_d:.0f} max={max(down_vals)} "
+          + ("OK: near zero in calm uptrends, spikes on declines."
+             if med_d <= 80 else "WARNING: typical too high; check filters."))
 
     if args.tc2000:
         ds, _, vs = args.tc2000.partition("=")
-        got = next((p["value"] for p in series if p["date"] == ds), None)
+        got = next((p["value"] for p in up_series if p["date"] == ds), None)
         if got is None:
             print(f"\nTC2000 check: {ds} not in series.")
         else:

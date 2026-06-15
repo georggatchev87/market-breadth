@@ -42,22 +42,19 @@ jobs:
           restore-keys: |
             grouped-cache-
 
-      - name: Generate breadth series
+      - name: Generate breadth series (up + down in one pass)
         env:
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
-          # "US Comm Stks" = common stocks. Set to "false" to include every
-          # stock-market security (ETFs, ADRs, preferreds, warrants, units...).
-          COMMON_STOCK_ONLY: "true"
-        run: python breadth.py --out breadth_5d_up20.json
+        run: python breadth.py --out breadth_5d_up20.json --down-out breadth_5d_down20.json
 
       - name: Commit & push if changed
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- breadth_5d_up20.json; then
-            echo "No change in breadth_5d_up20.json; nothing to commit."
+          if git diff --quiet -- breadth_5d_up20.json breadth_5d_down20.json; then
+            echo "No change in breadth JSON files; nothing to commit."
           else
-            git add breadth_5d_up20.json
-            git commit -m "Update breadth_5d_up20.json [skip ci]"
+            git add breadth_5d_up20.json breadth_5d_down20.json
+            git commit -m "Update breadth series (up + down) [skip ci]"
             git push
           fi

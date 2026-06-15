@@ -11,11 +11,17 @@ venues where **all three** conditions hold:
 3. `min( vol(D−1), vol(D−2), vol(D−3) ) > 100000`  (TC2000 `minv3.1`; the three
    sessions *before* D, excluding D)
 
-Output: [`breadth_5d_up20.json`](breadth_5d_up20.json) — an array sorted ascending:
+Outputs two arrays (same dates/ordering), sorted ascending:
+
+- [`breadth_5d_up20.json`](breadth_5d_up20.json) — `close(D)/close(D−5) ≥ 1.20`
+- [`breadth_5d_down20.json`](breadth_5d_down20.json) — bearish mirror,
+  `close(D)/close(D−5) < 0.80` (same $5 + min-volume floors)
 
 ```json
 [{"date": "2016-06-24", "value": 12}, ...]
 ```
+
+Both series are computed in a single pass over the cached bars.
 
 ## How it works
 
