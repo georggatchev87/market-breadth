@@ -467,27 +467,41 @@ def main() -> int:
     up_series = trim(up_series)
     down_series = trim(down_series)
 
-    # Self-healing report: the series is rebuilt from all cached bars up to the
-    # most recent FINAL session Massive has, so any missing days (e.g. after a
-    # skipped scheduled run) are appended automatically -- never fabricated,
-    # since a date only appears if grouped-daily actually returned rows for it.
-    def last_date(path):
-        p = Path(path)
-        if not p.exists():
-            return None
-        try:
-            arr = json.loads(p.read_text(encoding="utf-8"))
-            return arr[-1]["date"] if arr else None
-        except (json.JSONDecodeError, OSError, KeyError, IndexError):
-            return None
-
-    prev_last = last_date(args.out)
-
-    Path(args.out).write_text(json.dumps(up_series, indent=2) + "\n", encoding="utf-8")
-    Path(args.down_out).write_text(json.dumps(down_series, indent=2) + "\n", encoding="utf-8")
-
     if not up_series:
         print("No points produced."); return 1
+
+    # Self-healing + history-preserving merge. The series is rebuilt from all
+    # cached bars up to the most recent FINAL session Massive has, so missing
+    # days (e.g. after a skipped scheduled run) are appended automatically --
+    # never fabricated, since a date only appears if grouped-daily returned rows.
+    #
+    # We MERGE with the already-published file rather than overwriting: newly
+    # computed dates win for their range, but any earlier dates already on disk
+    # are kept. This keeps the 10-year start sticky -- the API serves a rolling
+    # ~10y window, so the oldest day eventually returns 403 and would otherwise
+    # drop off the front of a fresh rebuild. We only ever append/refresh.
+    def load_existing(path):
+        p = Path(path)
+        if not p.exists():
+            return {}
+        try:
+            return {x["date"]: x["value"]
+                    for x in json.loads(p.read_text(encoding="utf-8"))}
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
+            return {}
+
+    def merge_write(path, computed):
+        existing = load_existing(path)
+        prev_last = max(existing) if existing else None
+        merged = dict(existing)                 # preserve all prior history
+        for pt in computed:                     # computed wins for its range
+            merged[pt["date"]] = pt["value"]
+        out = [{"date": d, "value": merged[d]} for d in sorted(merged)]
+        Path(path).write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+        return out, prev_last
+
+    up_series, prev_last = merge_write(args.out, up_series)
+    down_series, _ = merge_write(args.down_out, down_series)
 
     new_last = up_series[-1]["date"]
     appended = [p["date"] for p in up_series if prev_last is None or p["date"] > prev_last]
