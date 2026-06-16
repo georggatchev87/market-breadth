@@ -129,7 +129,16 @@ class MassiveClient:
                 backoff = min(backoff * 2, 30)
                 continue
             if r.status_code == 200:
-                return r.json()
+                try:
+                    return r.json()
+                except ValueError:
+                    # Truncated/corrupt body (transient during large pulls) ->
+                    # retry with backoff rather than crashing the whole run.
+                    if attempt == self.max_retries:
+                        raise
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                    continue
             if r.status_code == 403 and allow_forbidden:
                 return None
             if r.status_code == 429:
