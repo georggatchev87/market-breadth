@@ -80,9 +80,12 @@ MIN_VOLUME = 100_000      # min(volume over that window) must be STRICTLY > this
 # Pre-coverage dates return HTTP 403 and are skipped gracefully.
 START_DATE = "2016-06-17"
 
-# Session considered final after this ET hour (EOD settle); current forming day
-# is never emitted.
-SESSION_FINAL_HOUR_ET = 20
+# A trading session is treated as final (EOD data settled) only after this ET
+# hour, so the still-forming current day is never emitted. 18:00 ET = 2 hours
+# after the 16:00 close, which is enough for Massive's EOD grouped data to be
+# available. The scheduled "after close" run is timed to fire after this hour;
+# the early-morning safety-net run sees the prior day as already-final.
+SESSION_FINAL_HOUR_ET = 18
 
 
 class RateLimitError(RuntimeError):
@@ -455,11 +458,32 @@ def main() -> int:
     up_series = trim(up_series)
     down_series = trim(down_series)
 
+    # Self-healing report: the series is rebuilt from all cached bars up to the
+    # most recent FINAL session Massive has, so any missing days (e.g. after a
+    # skipped scheduled run) are appended automatically -- never fabricated,
+    # since a date only appears if grouped-daily actually returned rows for it.
+    def last_date(path):
+        p = Path(path)
+        if not p.exists():
+            return None
+        try:
+            arr = json.loads(p.read_text(encoding="utf-8"))
+            return arr[-1]["date"] if arr else None
+        except (json.JSONDecodeError, OSError, KeyError, IndexError):
+            return None
+
+    prev_last = last_date(args.out)
+
     Path(args.out).write_text(json.dumps(up_series, indent=2) + "\n", encoding="utf-8")
     Path(args.down_out).write_text(json.dumps(down_series, indent=2) + "\n", encoding="utf-8")
 
     if not up_series:
         print("No points produced."); return 1
+
+    new_last = up_series[-1]["date"]
+    appended = [p["date"] for p in up_series if prev_last is None or p["date"] > prev_last]
+    print(f"\nSelf-heal: previous last date={prev_last or 'n/a'} -> new last date={new_last} "
+          f"({len(appended)} day(s) appended{': ' + ', '.join(appended) if appended else ''}).")
 
     def stats(series, name):
         vals = [p["value"] for p in series]

@@ -2,10 +2,16 @@ name: Publish breadth series
 
 on:
   schedule:
-    # 21:15 UTC = 17:15 ET (EDT) / 16:15 ET (EST) — shortly after the US close.
-    # Cron runs in UTC and does not shift with DST; this fires after the close
-    # year-round. The script only emits sessions it considers final.
-    - cron: "15 21 * * 1-5"
+    # Cron is always UTC and does not shift with DST. Two runs per weekday:
+    #
+    # 1) After the US close: 23:30 UTC = 19:30 ET (EDT) / 18:30 ET (EST). Both
+    #    are past the script's 18:00-ET "session final" gate, so this run emits
+    #    the SAME trading day's value once Massive's EOD data is available.
+    - cron: "30 23 * * 1-5"
+    # 2) Early-morning safety net: 10:30 UTC = 06:30 ET (EDT) / 05:30 ET (EST).
+    #    The pipeline is self-healing, so if the evening run was missed/failed,
+    #    this run appends the prior day(s). Harmless if already up to date.
+    - cron: "30 10 * * 1-5"
   workflow_dispatch: {}
 
 # Allow the job to push the updated JSON back to the repo.
@@ -42,10 +48,26 @@ jobs:
           restore-keys: |
             grouped-cache-
 
+      - name: Check API key is present
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+        run: |
+          if [ -z "${MASSIVE_API_KEY}" ]; then
+            echo "::error::Repo secret MASSIVE_API_KEY is missing. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
       - name: Generate breadth series (up + down in one pass)
         env:
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
-        run: python breadth.py --out breadth_5d_up20.json --down-out breadth_5d_down20.json
+        shell: bash
+        # -e: any failure (incl. Massive API errors -> non-zero exit) fails the
+        # job visibly in the Actions tab instead of silently doing nothing.
+        run: |
+          set -euo pipefail
+          python breadth.py --out breadth_5d_up20.json --down-out breadth_5d_down20.json
+          echo "Up series tail:";   tail -n 4 breadth_5d_up20.json
+          echo "Down series tail:"; tail -n 4 breadth_5d_down20.json
 
       - name: Commit & push if changed
         run: |
