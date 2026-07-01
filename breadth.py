@@ -87,6 +87,23 @@ START_DATE = "2016-06-17"
 # the early-morning safety-net run sees the prior day as already-final.
 SESSION_FINAL_HOUR_ET = 18
 
+# ---------------------- PRE-CLOSE PREVIEW CONFIG --------------------------- #
+# The optional "preview" mode writes a PROVISIONAL value for today ~1h before the
+# close, using each stock's current intraday price (from the full-market
+# snapshot) as today's price. Everything else (close(D-5), the D-1..D-3 volumes,
+# the universe, the qualifier) is identical to the finalizer -- it reuses the
+# very same count_day(), so the two runs cannot drift.
+SNAPSHOT_PATH = "/v2/snapshot/locale/us/markets/stocks/tickers"  # all US tickers, 1 call
+MARKETSTATUS_NOW = "/v1/marketstatus/now"
+MARKETSTATUS_UPCOMING = "/v1/marketstatus/upcoming"
+REGULAR_CLOSE_ET = dt.time(16, 0)     # normal US equities close (4:00pm ET)
+# Valid preview window: only compute+write when "now" is within this many
+# minutes before today's ACTUAL close (half-day aware). Targets ~1h before,
+# widened to tolerate GitHub's cron drift; outside it the run exits quietly.
+PREVIEW_WINDOW_MIN = 30
+PREVIEW_WINDOW_MAX = 90
+STATUS_FILE = "status.json"
+
 
 class RateLimitError(RuntimeError):
     """Raised when the API rate/quota limit blocks progress (resume by re-running)."""
@@ -423,6 +440,175 @@ def compute_series(sessions, universe, cfg):
 
 
 # --------------------------------------------------------------------------- #
+# Pre-close preview (provisional "today so far") + status tracking
+# --------------------------------------------------------------------------- #
+def fetch_snapshot(client: MassiveClient) -> dict[str, float]:
+    """Current intraday price per ticker from the full-market snapshot (one call).
+    Price preference: last trade -> last minute close -> day close-so-far."""
+    data = client.get(SNAPSHOT_PATH, {"include_otc": "false"})
+    out: dict[str, float] = {}
+    for t in data.get("tickers") or []:
+        sym = t.get("ticker")
+        if not sym:
+            continue
+        price = None
+        for obj, field in (("lastTrade", "p"), ("min", "c"), ("day", "c")):
+            v = (t.get(obj) or {}).get(field)
+            if isinstance(v, (int, float)) and v > 0:
+                price = float(v)
+                break
+        if price is not None:
+            out[sym] = price
+    return out
+
+
+def _parse_et(iso: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(iso).astimezone(ET)
+
+
+def _today_close_et(client: MassiveClient, today: dt.date) -> dt.datetime:
+    """Today's actual close in ET (16:00 normally; 13:00-ish on early-close
+    half-days, read from the calendar). Defaults to the regular close."""
+    close = dt.datetime.combine(today, REGULAR_CLOSE_ET, tzinfo=ET)
+    try:
+        data = client.get(MARKETSTATUS_UPCOMING)
+    except Exception:
+        return close
+    rows = data if isinstance(data, list) else (data.get("results") or [])
+    for e in rows:
+        if (e.get("date") == today.isoformat()
+                and str(e.get("status", "")).lower() == "early-close"
+                and e.get("exchange") in ("NYSE", "NASDAQ")):
+            raw = e.get("close")
+            if raw:
+                try:
+                    return _parse_et(str(raw).replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+    return close
+
+
+def preview_gate(client: MassiveClient):
+    """Return (close_et, now_et, today, reason). close_et is None when NOT a
+    valid preview moment (market not open, or outside the pre-close window)."""
+    ns = client.get(MARKETSTATUS_NOW)
+    market = str(ns.get("market") or "").lower()
+    server = ns.get("serverTime")
+    now_et = _parse_et(server) if server else dt.datetime.now(ET)
+    today = now_et.date()
+    if market != "open":
+        return None, now_et, today, f"market is '{market or 'unknown'}' (not a regular open session)"
+    close_et = _today_close_et(client, today)
+    mins = (close_et - now_et).total_seconds() / 60.0
+    if not (PREVIEW_WINDOW_MIN <= mins <= PREVIEW_WINDOW_MAX):
+        return None, now_et, today, (f"{mins:.0f} min before close {close_et:%H:%M} ET "
+                                     f"(need {PREVIEW_WINDOW_MIN}-{PREVIEW_WINDOW_MAX})")
+    return close_et, now_et, today, f"OK: {mins:.0f} min before close {close_et:%H:%M} ET"
+
+
+def load_status(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_status(path: str, date_str: str, state: str,
+                 up_value=None, down_value=None) -> dict:
+    obj = {
+        "date": date_str,
+        "state": state,  # "provisional" (pre-close preview) or "final" (settled)
+        "updated_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if up_value is not None:
+        obj["up_value"] = up_value
+    if down_value is not None:
+        obj["down_value"] = down_value
+    Path(path).write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+    return obj
+
+
+def upsert_row(path: str, date_str: str, value: int) -> None:
+    """Set/replace ONLY today's {date,value} row; never touch any other date."""
+    p = Path(path)
+    arr = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+    m = {x["date"]: x["value"] for x in arr}
+    m[date_str] = value
+    out = [{"date": d, "value": m[d]} for d in sorted(m)]
+    p.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+
+
+def run_preview(args, cfg, client) -> int:
+    """Compute and (only inside a valid window) write today's PROVISIONAL value,
+    reusing the exact finalizer math. Only today's row is ever touched."""
+    if args.force_preview:
+        now_et = dt.datetime.now(ET)
+        today = now_et.date()
+        close_et = None
+        print("FORCED preview: time gate bypassed (testing only; will not commit).")
+    else:
+        close_et, now_et, today, reason = preview_gate(client)
+        print(f"Preview gate: {reason}")
+        if close_et is None:
+            print("Not a valid preview window -> exiting quietly without writing.")
+            return 0
+    today_iso = today.isoformat()
+
+    # Safety: never overwrite a value already marked FINAL for today (e.g. if the
+    # preview fires late, after the finalizer already settled today).
+    st = load_status(args.status_out)
+    if st.get("date") == today_iso and st.get("state") == "final":
+        print(f"{today_iso} is already FINAL in {args.status_out}; preview will not overwrite.")
+        return 0
+
+    # Settled bars through the PRIOR session (self-healing; reuses the cache).
+    series_start = dt.date.fromisoformat(args.start_date)
+    fetch_start = series_start - dt.timedelta(days=20)
+    universe = build_universe(client)
+    settled = gather_sessions(client, Path(args.cache_dir), fetch_start,
+                              today - dt.timedelta(days=1), args.workers)
+    settled.pop(today_iso, None)  # today is NOT settled
+
+    # Live snapshot -> synthetic "today" session (price only; today's volume is
+    # never used -- the volume floor uses the settled D-1..D-3 bars).
+    snap = fetch_snapshot(client)
+    today_bars = {sym: [price, 0.0] for sym, price in snap.items() if price > 0}
+    if not today_bars:
+        raise SystemExit("Snapshot returned no usable intraday prices; aborting preview.")
+
+    sessions = dict(settled)
+    sessions[today_iso] = today_bars
+    days = sorted(d for d, bars in sessions.items() if bars)
+    i = days.index(today_iso)
+    need = max(cfg.move_lookback, cfg.vol_lookback)
+    if i < need:
+        raise SystemExit(f"Not enough settled history before {today_iso} "
+                         f"(have {i}, need {need}).")
+
+    # THE SAME count_day used by the finalizer -- no drift possible.
+    res = count_day(i, days, sessions, universe, cfg)
+    up_val, down_val = res["up"], res["down"]
+
+    print(f"\nPROVISIONAL (today so far, {today_iso}, snapshot @ current prices):")
+    print(f"  UP   (5 Day up 20%)   = {up_val}")
+    print(f"  DOWN (5 Day down 20%) = {down_val}")
+
+    if args.dry_run or args.force_preview:
+        why = "dry-run" if args.dry_run else "forced/outside a confirmed window"
+        print(f"\n{why.upper()}: printed only -- no files written, no history changed.")
+        return 0
+
+    upsert_row(args.out, today_iso, up_val)
+    upsert_row(args.down_out, today_iso, down_val)
+    write_status(args.status_out, today_iso, "provisional", up_val, down_val)
+    print(f"\nWrote PROVISIONAL {today_iso}: {args.out}, {args.down_out}; status -> provisional.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> int:
@@ -441,11 +627,23 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--tc2000", metavar="YYYY-MM-DD=VALUE",
                     help="known TC2000/Stockbee value to compare for tuning")
+    ap.add_argument("--mode", choices=("finalize", "preview"), default="finalize",
+                    help="finalize = settled after-close run (default); "
+                         "preview = provisional pre-close 'today so far' run")
+    ap.add_argument("--status-out", default=STATUS_FILE,
+                    help="provisional/final tracking file")
+    ap.add_argument("--force-preview", action="store_true",
+                    help="preview mode: bypass the time gate (testing; never commits)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="compute and print only; write nothing")
     args = ap.parse_args()
 
     cfg = Cfg(args.lookback, args.threshold, args.down_threshold,
               args.price_floor, args.vol_lookback, args.min_volume)
     client = MassiveClient(os.environ.get("MASSIVE_API_KEY", ""))
+
+    if args.mode == "preview":
+        return run_preview(args, cfg, client)
 
     now_et = dt.datetime.now(ET)
     today_et = now_et.date()
@@ -507,6 +705,12 @@ def main() -> int:
     appended = [p["date"] for p in up_series if prev_last is None or p["date"] > prev_last]
     print(f"\nSelf-heal: previous last date={prev_last or 'n/a'} -> new last date={new_last} "
           f"({len(appended)} day(s) appended{': ' + ', '.join(appended) if appended else ''}).")
+
+    # The finalizer's value is the settled, authoritative close: mark it FINAL so
+    # a late-firing preview never overwrites it.
+    write_status(args.status_out, new_last, "final",
+                 up_series[-1]["value"], down_series[-1]["value"])
+    print(f"status -> final ({new_last}).")
 
     def stats(series, name):
         vals = [p["value"] for p in series]

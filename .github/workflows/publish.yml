@@ -10,13 +10,28 @@ on:
     # spread-out times maximizes the chance at least one fires each day and, if
     # any run is missed, the next one automatically backfills the gap.
     #
-    # 1) After the US close: 23:17 UTC = 19:17 ET (EDT) / 18:17 ET (EST), past
-    #    the script's 18:00-ET "session final" gate, so it emits the same day.
+    # 1) FINALIZER after the US close: 23:17 UTC = 19:17 ET (EDT) / 18:17 ET
+    #    (EST), past the 18:00-ET "session final" gate -> settles today.
     - cron: "17 23 * * *"
-    # 2) Morning safety net: 10:47 UTC = 06:47 ET (EDT) / 05:47 ET (EST); picks
-    #    up the prior trading day if the evening run was missed.
+    # 2) FINALIZER morning safety net: 10:47 UTC; picks up the prior trading day
+    #    if the evening run was missed.
     - cron: "47 10 * * *"
-  workflow_dispatch: {}
+    #
+    # PREVIEW runs (provisional "today so far", ~1h before the close). These
+    # bracket both DST offsets AND half-day (13:00 ET) closes; the script gates
+    # each run to the real pre-close window and exits quietly otherwise, so the
+    # extra firings are harmless. Two minutes give two chances despite drift:
+    #   regular close 16:00 ET -> 18:xx/19:xx UTC (EDT), 19:xx/20:xx UTC (EST)
+    #   half-day     13:00 ET -> 15:xx/16:xx UTC (EDT), 16:xx/17:xx UTC (EST)
+    - cron: "45 15,16,18,19 * * *"
+    - cron: "0 16,17,19,20 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "finalize (settled) or preview (provisional 'today so far')"
+        type: choice
+        options: [finalize, preview]
+        default: finalize
 
 # Allow the job to push the updated JSON back to the repo.
 permissions:
@@ -61,7 +76,25 @@ jobs:
             exit 1
           fi
 
-      - name: Generate breadth series (up + down in one pass)
+      # Route each trigger to preview vs finalize. The two PREVIEW crons run in
+      # preview mode; everything else (the finalizer crons) finalizes. A manual
+      # dispatch uses the chosen input (default finalize).
+      - name: Determine run mode
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ github.event.inputs.mode }}"
+          else
+            case "${{ github.event.schedule }}" in
+              "45 15,16,18,19 * * *"|"0 16,17,19,20 * * *") MODE="preview" ;;
+              *) MODE="finalize" ;;
+            esac
+          fi
+          echo "mode=${MODE:-finalize}" >> "$GITHUB_OUTPUT"
+          echo "Run mode: ${MODE:-finalize}"
+
+      - name: Generate breadth series (${{ steps.mode.outputs.mode }})
         env:
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
         shell: bash
@@ -69,7 +102,10 @@ jobs:
         # job visibly in the Actions tab instead of silently doing nothing.
         run: |
           set -euo pipefail
-          python breadth.py --out breadth_5d_up20.json --down-out breadth_5d_down20.json
+          python breadth.py --mode "${{ steps.mode.outputs.mode }}" \
+            --out breadth_5d_up20.json --down-out breadth_5d_down20.json \
+            --status-out status.json
+          echo "status.json:"; cat status.json 2>/dev/null || echo "(not written this run)"
           echo "Up series tail:";   tail -n 4 breadth_5d_up20.json
           echo "Down series tail:"; tail -n 4 breadth_5d_down20.json
 
@@ -77,10 +113,10 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- breadth_5d_up20.json breadth_5d_down20.json; then
-            echo "No change in breadth JSON files; nothing to commit."
+          if git diff --quiet -- breadth_5d_up20.json breadth_5d_down20.json status.json; then
+            echo "No change in output files; nothing to commit."
           else
-            git add breadth_5d_up20.json breadth_5d_down20.json
-            git commit -m "Update breadth series (up + down) [skip ci]"
+            git add breadth_5d_up20.json breadth_5d_down20.json status.json
+            git commit -m "Update breadth series (${{ steps.mode.outputs.mode }}) [skip ci]"
             git push
           fi
