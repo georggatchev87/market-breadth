@@ -87,21 +87,22 @@ START_DATE = "2016-06-17"
 # the early-morning safety-net run sees the prior day as already-final.
 SESSION_FINAL_HOUR_ET = 18
 
-# ---------------------- PRE-CLOSE PREVIEW CONFIG --------------------------- #
-# The optional "preview" mode writes a PROVISIONAL value for today ~1h before the
-# close, using each stock's current intraday price (from the full-market
-# snapshot) as today's price. Everything else (close(D-5), the D-1..D-3 volumes,
-# the universe, the qualifier) is identical to the finalizer -- it reuses the
-# very same count_day(), so the two runs cannot drift.
+# --------------------- INTRADAY PREVIEW CONFIG ---------------------------- #
+# The "preview" mode writes a PROVISIONAL "today so far" value using each stock's
+# current intraday price (from the full-market snapshot) as today's price.
+# Everything else (close(D-5), the D-1..D-3 volumes, the universe, the qualifier)
+# is identical to the finalizer -- it reuses the very same count_day(), so the
+# two runs cannot drift.
+#
+# The gate is deliberately LENIENT (not a narrow pre-close window): a provisional
+# value is just "today so far", so any afternoon run is fine. This makes the
+# preview immune to GitHub's cron drift/drops -- the preview workflow fires every
+# ~20 min through the afternoon and each run overwrites today's provisional with
+# the latest snapshot. A preview is written whenever the market is OPEN today and
+# it is at/after this Eastern time:
 SNAPSHOT_PATH = "/v2/snapshot/locale/us/markets/stocks/tickers"  # all US tickers, 1 call
 MARKETSTATUS_NOW = "/v1/marketstatus/now"
-MARKETSTATUS_UPCOMING = "/v1/marketstatus/upcoming"
-REGULAR_CLOSE_ET = dt.time(16, 0)     # normal US equities close (4:00pm ET)
-# Valid preview window: only compute+write when "now" is within this many
-# minutes before today's ACTUAL close (half-day aware). Targets ~1h before,
-# widened to tolerate GitHub's cron drift; outside it the run exits quietly.
-PREVIEW_WINDOW_MIN = 30
-PREVIEW_WINDOW_MAX = 90
+PREVIEW_EARLIEST_ET = dt.time(13, 30)   # 1:30pm ET; no upper bound (until close)
 STATUS_FILE = "status.json"
 
 
@@ -466,44 +467,23 @@ def _parse_et(iso: str) -> dt.datetime:
     return dt.datetime.fromisoformat(iso).astimezone(ET)
 
 
-def _today_close_et(client: MassiveClient, today: dt.date) -> dt.datetime:
-    """Today's actual close in ET (16:00 normally; 13:00-ish on early-close
-    half-days, read from the calendar). Defaults to the regular close."""
-    close = dt.datetime.combine(today, REGULAR_CLOSE_ET, tzinfo=ET)
-    try:
-        data = client.get(MARKETSTATUS_UPCOMING)
-    except Exception:
-        return close
-    rows = data if isinstance(data, list) else (data.get("results") or [])
-    for e in rows:
-        if (e.get("date") == today.isoformat()
-                and str(e.get("status", "")).lower() == "early-close"
-                and e.get("exchange") in ("NYSE", "NASDAQ")):
-            raw = e.get("close")
-            if raw:
-                try:
-                    return _parse_et(str(raw).replace("Z", "+00:00"))
-                except ValueError:
-                    pass
-    return close
-
-
 def preview_gate(client: MassiveClient):
-    """Return (close_et, now_et, today, reason). close_et is None when NOT a
-    valid preview moment (market not open, or outside the pre-close window)."""
+    """Lenient, drift-proof gate. Return (ok, now_et, today, reason). ok is True
+    when the US market is OPEN today AND it is at/after PREVIEW_EARLIEST_ET
+    (~1:30pm ET) -- no upper bound. Any afternoon run qualifies, so GitHub's
+    scheduler drift/drops can't cause a miss."""
     ns = client.get(MARKETSTATUS_NOW)
     market = str(ns.get("market") or "").lower()
     server = ns.get("serverTime")
     now_et = _parse_et(server) if server else dt.datetime.now(ET)
     today = now_et.date()
     if market != "open":
-        return None, now_et, today, f"market is '{market or 'unknown'}' (not a regular open session)"
-    close_et = _today_close_et(client, today)
-    mins = (close_et - now_et).total_seconds() / 60.0
-    if not (PREVIEW_WINDOW_MIN <= mins <= PREVIEW_WINDOW_MAX):
-        return None, now_et, today, (f"{mins:.0f} min before close {close_et:%H:%M} ET "
-                                     f"(need {PREVIEW_WINDOW_MIN}-{PREVIEW_WINDOW_MAX})")
-    return close_et, now_et, today, f"OK: {mins:.0f} min before close {close_et:%H:%M} ET"
+        return False, now_et, today, f"market is '{market or 'unknown'}' (not open) -> skip"
+    cutoff = dt.datetime.combine(today, PREVIEW_EARLIEST_ET, tzinfo=ET)
+    if now_et < cutoff:
+        return False, now_et, today, (f"{now_et:%H:%M} ET is before "
+                                      f"{PREVIEW_EARLIEST_ET:%H:%M} ET -> skip")
+    return True, now_et, today, f"OK: market open, {now_et:%H:%M} ET (>= {PREVIEW_EARLIEST_ET:%H:%M})"
 
 
 def load_status(path: str) -> dict:
@@ -547,13 +527,12 @@ def run_preview(args, cfg, client) -> int:
     if args.force_preview:
         now_et = dt.datetime.now(ET)
         today = now_et.date()
-        close_et = None
-        print("FORCED preview: time gate bypassed (testing only; will not commit).")
+        print("FORCED preview: gate bypassed (testing only; will not commit).")
     else:
-        close_et, now_et, today, reason = preview_gate(client)
+        ok, now_et, today, reason = preview_gate(client)
         print(f"Preview gate: {reason}")
-        if close_et is None:
-            print("Not a valid preview window -> exiting quietly without writing.")
+        if not ok:
+            print("Not a valid preview time -> exiting quietly without writing.")
             return 0
     today_iso = today.isoformat()
 

@@ -1,0 +1,83 @@
+name: Preview breadth (provisional)
+
+# Writes a PROVISIONAL "today so far" value for both series during the trading
+# afternoon. Runs OFTEN and is drift-proof: the script gates to "market open AND
+# >= 1:30pm ET" (no upper bound), only ever writes TODAY's row, and never
+# overwrites a day already marked "final". The after-close finalizer
+# (publish.yml) later replaces today's provisional with the settled value.
+
+on:
+  schedule:
+    # Every 20 minutes across the US trading afternoon, bracketing daylight
+    # saving. The gate makes early/after-close firings no-ops, so firing many
+    # times is safe and means GitHub's cron drift/drops cannot cause a miss --
+    # each successful run overwrites today's provisional with the latest snapshot.
+    #   EDT afternoon 13:30-16:00 ET = 17:30-20:00 UTC
+    #   EST afternoon 13:30-16:00 ET = 18:30-21:00 UTC
+    - cron: "*/20 17-21 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# Shared with the finalizer workflow so the two never push at the same time.
+concurrency:
+  group: publish-breadth
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore grouped-daily cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: grouped-cache-${{ github.run_id }}
+          restore-keys: |
+            grouped-cache-
+
+      - name: Check API key is present
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+        run: |
+          if [ -z "${MASSIVE_API_KEY}" ]; then
+            echo "::error::Repo secret MASSIVE_API_KEY is missing. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Compute provisional preview
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+        shell: bash
+        # -e: any Massive API error -> non-zero exit -> visible red failure in
+        # the Actions tab (never a silent no-op).
+        run: |
+          set -euo pipefail
+          python breadth.py --mode preview \
+            --out breadth_5d_up20.json --down-out breadth_5d_down20.json \
+            --status-out status.json
+          echo "status.json:"; cat status.json 2>/dev/null || echo "(no provisional written this run)"
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- breadth_5d_up20.json breadth_5d_down20.json status.json; then
+            echo "No change (outside preview window or identical); nothing to commit."
+          else
+            git add breadth_5d_up20.json breadth_5d_down20.json status.json
+            git commit -m "Preview: provisional today [skip ci]"
+            git push
+          fi

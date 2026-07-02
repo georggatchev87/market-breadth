@@ -10,21 +10,13 @@ on:
     # spread-out times maximizes the chance at least one fires each day and, if
     # any run is missed, the next one automatically backfills the gap.
     #
-    # 1) FINALIZER after the US close: 23:17 UTC = 19:17 ET (EDT) / 18:17 ET
-    #    (EST), past the 18:00-ET "session final" gate -> settles today.
+    # FINALIZER after the US close: 23:17 UTC = 19:17 ET (EDT) / 18:17 ET (EST),
+    # past the 18:00-ET "session final" gate -> settles today.
     - cron: "17 23 * * *"
-    # 2) FINALIZER morning safety net: 10:47 UTC; picks up the prior trading day
-    #    if the evening run was missed.
+    # FINALIZER morning safety net: 10:47 UTC; picks up the prior trading day if
+    # the evening run was missed.
     - cron: "47 10 * * *"
-    #
-    # PREVIEW runs (provisional "today so far", ~1h before the close). These
-    # bracket both DST offsets AND half-day (13:00 ET) closes; the script gates
-    # each run to the real pre-close window and exits quietly otherwise, so the
-    # extra firings are harmless. Two minutes give two chances despite drift:
-    #   regular close 16:00 ET -> 18:xx/19:xx UTC (EDT), 19:xx/20:xx UTC (EST)
-    #   half-day     13:00 ET -> 15:xx/16:xx UTC (EDT), 16:xx/17:xx UTC (EST)
-    - cron: "45 15,16,18,19 * * *"
-    - cron: "0 16,17,19,20 * * *"
+    # (The provisional intraday PREVIEW lives in its own workflow, preview.yml.)
   workflow_dispatch:
     inputs:
       mode:
@@ -76,21 +68,14 @@ jobs:
             exit 1
           fi
 
-      # Route each trigger to preview vs finalize. The two PREVIEW crons run in
-      # preview mode; everything else (the finalizer crons) finalizes. A manual
-      # dispatch uses the chosen input (default finalize).
+      # Scheduled runs here are ALWAYS the finalizer. Manual dispatch may pick a
+      # mode (default finalize). The intraday preview is a separate workflow, so
+      # there is no fragile per-cron routing.
       - name: Determine run mode
         id: mode
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${{ github.event.inputs.mode }}"
-          else
-            case "${{ github.event.schedule }}" in
-              "45 15,16,18,19 * * *"|"0 16,17,19,20 * * *") MODE="preview" ;;
-              *) MODE="finalize" ;;
-            esac
-          fi
+          MODE="${{ github.event.inputs.mode }}"
           echo "mode=${MODE:-finalize}" >> "$GITHUB_OUTPUT"
           echo "Run mode: ${MODE:-finalize}"
 
